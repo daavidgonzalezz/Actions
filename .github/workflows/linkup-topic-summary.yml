@@ -1,0 +1,187 @@
+name: Linkup Topic Summary
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: Topic to search in Linkup
+        required: true
+        type: string
+      depth:
+        description: Search depth
+        required: false
+        default: standard
+        type: choice
+        options:
+          - standard
+          - deep
+
+permissions:
+  contents: read
+  models: read
+
+jobs:
+  summarize-topic:
+    name: Search with Linkup and summarize
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Search topic with Linkup API
+        id: linkup_search
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          LINKUP_API_KEY: ${{ secrets.LINKUP_API_KEY }}
+          TOPIC: ${{ inputs.topic }}
+          DEPTH: ${{ inputs.depth }}
+        with:
+          script: |
+            const apiKey = process.env.LINKUP_API_KEY;
+            const topic = process.env.TOPIC;
+            const depth = process.env.DEPTH || 'standard';
+
+            if (!apiKey) {
+              core.setFailed('Missing secret: LINKUP_API_KEY');
+              return;
+            }
+
+            if (!topic || !topic.trim()) {
+              core.setFailed('Input "topic" is required');
+              return;
+            }
+
+            const payload = {
+              query: topic,
+              depth,
+              output_type: 'searchResults',
+              include_images: false
+            };
+
+            console.log('Sending Linkup search request...');
+
+            let response;
+            try {
+              response = await fetch('https://api.linkup.so/v1/search', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${apiKey}`
+                },
+                body: JSON.stringify(payload)
+              });
+            } catch (error) {
+              core.setFailed(`Network error while calling Linkup API: ${error.message}`);
+              return;
+            }
+
+            if (!response.ok) {
+              const errorBody = await response.text();
+              core.setFailed(`Linkup API request failed (${response.status}): ${errorBody}`);
+              return;
+            }
+
+            let data;
+            try {
+              data = await response.json();
+            } catch (error) {
+              core.setFailed(`Failed to parse Linkup API response as JSON: ${error.message}`);
+              return;
+            }
+
+            const candidateResults = [
+              data?.results,
+              data?.items,
+              data?.searchResults,
+              data?.output?.results
+            ].find(Array.isArray) || [];
+
+            const summarizeText = (value, maxLen = 450) => {
+              if (!value || typeof value !== 'string') {
+                return '';
+              }
+              const clean = value.replace(/\s+/g, ' ').trim();
+              if (clean.length <= maxLen) {
+                return clean;
+              }
+              return `${clean.slice(0, maxLen)}...`;
+            };
+
+            const normalizedResults = candidateResults.slice(0, 12).map((item, index) => {
+              const title = item?.title || item?.name || item?.source || `Result ${index + 1}`;
+              const url = item?.url || item?.link || item?.source_url || '';
+              const snippet = summarizeText(
+                item?.snippet ||
+                item?.content ||
+                item?.summary ||
+                item?.text ||
+                ''
+              );
+
+              return {
+                title,
+                url,
+                snippet
+              };
+            });
+
+            if (normalizedResults.length === 0) {
+              console.log('No results returned by Linkup');
+              core.setOutput('has_results', 'false');
+              core.setOutput('results_json', '[]');
+              return;
+            }
+
+            console.log(`Collected ${normalizedResults.length} results from Linkup`);
+            core.setOutput('has_results', 'true');
+            core.setOutput('results_json', JSON.stringify(normalizedResults));
+
+      - name: Summarize search results with AI
+        id: ai_summary
+        if: steps.linkup_search.outputs.has_results == 'true'
+        uses: actions/ai-inference@a380166897b5408b8fb7dddd148142794cb5624a # v2.0.6
+        with:
+          model: openai/gpt-4.1
+          system-prompt: |
+            You are a precise technical research summarizer.
+            Produce a concise, factual summary from search results.
+            Requirements:
+            - Focus only on information present in the provided results.
+            - Organize output in these sections:
+              1) Executive summary
+              2) Key findings (bullet list)
+              3) Sources (bullet list with title and URL)
+            - If evidence is weak or conflicting, explicitly say so.
+          prompt: |
+            Topic: ${{ inputs.topic }}
+
+            Search results from Linkup (JSON):
+            ${{ steps.linkup_search.outputs.results_json }}
+
+            Write a clear summary in Markdown.
+          max-tokens: 700
+
+      - name: Publish summary to workflow run
+        if: steps.linkup_search.outputs.has_results == 'true'
+        env:
+          TOPIC: ${{ inputs.topic }}
+          SUMMARY: ${{ steps.ai_summary.outputs.response }}
+        run: |
+          {
+            echo "# Linkup topic summary"
+            echo
+            echo "**Topic:** ${TOPIC}"
+            echo
+            echo "${SUMMARY}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report no results
+        if: steps.linkup_search.outputs.has_results != 'true'
+        env:
+          TOPIC: ${{ inputs.topic }}
+        run: |
+          {
+            echo "# Linkup topic summary"
+            echo
+            echo "**Topic:** ${TOPIC}"
+            echo
+            echo "No search results were returned by Linkup for this topic."
+          } >> "$GITHUB_STEP_SUMMARY"
