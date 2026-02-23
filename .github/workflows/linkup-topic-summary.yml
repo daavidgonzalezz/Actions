@@ -50,9 +50,9 @@ jobs:
             }
 
             const payload = {
-              query: topic,
+              q: topic,
               depth,
-              output_type: 'searchResults',
+              outputType: 'searchResults',
               include_images: false
             };
 
